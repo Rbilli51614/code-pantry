@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+set -e
+
+ROOT="jenkins-k8s-cicd"
+
+echo "Creating project: $ROOT"
+mkdir -p $ROOT
+cd $ROOT
+
+# ------------------------------------------------------------------------------
+# Root files
+# ------------------------------------------------------------------------------
+cat > README.md << 'EOF'
+# CI/CD to Kubernetes with Jenkins (EKS & GKE)
+
+This repo demonstrates a full pipeline:
+1) Build & test a Python FastAPI app
+2) Build & push a container image
+3) Deploy to Kubernetes via Helm (dev → stage → prod)
+
+## What’s included
+- FastAPI app with `/healthz` and `/` routes
+- Helm chart (HPA, svc, deployment)
+- Terraform skeletons for EKS (AWS) and GKE (Google Cloud)
+- Jenkins declarative pipeline with params for cloud & environment
+
+## Quick start (local)
+# 1) build & run
+make docker-build
+make docker-run
+curl http://localhost:8000/healthz
+
+# 2) kind (optional)
+make kind-up
+make helm-dev
+
+## Jenkins
+- Set credentials (see "Jenkins credentials" below)
+- Run pipeline with parameters
+
+## Environments
+- dev (default), stage, prod namespaces defined in k8s/namespaces.yaml
+
+## Next steps
+- Add image scanning (Trivy) & IaC scanning (tfsec)
+- Wire Terraform remote state & state locking
+EOF
+
+cat > .gitignore << 'EOF'
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+coverage/
+**/.terraform/*
+*.tfstate*
+.terraform.lock.hcl
+.DS_Store
+EOF
+
+cat > LICENSE << 'EOF'
+MIT License
+EOF
+
+cat > Makefile << 'EOF'
+APP_NAME=fastapi-app
+IMAGE?=ghcr.io/youruser/fastapi-app:$(shell git rev-parse --short HEAD)
+
+docker-build:
+	docker build -t $(IMAGE) .
+
+docker-run:
+	docker run --rm -p 8000:8000 $(IMAGE)
+
+tests:
+	python -m pytest -q
+
+kind-up:
+	kind create cluster --name cicd || true
+	kubectl apply -f k8s/namespaces.yaml
+
+helm-dev:
+	helm upgrade --install $(APP_NAME) ./helm/app-chart -n dev --create-namespace -f helm/app-chart/values.yaml
+
+helm-stage:
+	helm upgrade --install $(APP_NAME) ./helm/app-chart -n stage -f helm/app-chart/values-stage.yaml
+
+helm-prod:
+	helm upgrade --install $(APP_NAME) ./helm/app-chart -n prod -f helm/app-chart/values-prod.yaml
+EOF
+
+# ------------------------------------------------------------------------------
+# app/
+# ------------------------------------------------------------------------------
+mkdir -p app/tests
+
+cat > app/main.py << 'EOF'
+from fastapi import FastAPI
+import os
+
+app = FastAPI()
+SERVICE_NAME = os.getenv("SERVICE_NAME", "fastapi-app")
+ENV = os.getenv("APP_ENV", "dev")
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": SERVICE_NAME, "env": ENV}
+
+@app.get("/")
+def root():
+    return {"hello": "world", "service": SERVICE_NAME, "env": ENV}
+EOF
+
+cat > app/requirements.txt << 'EOF'
+fastapi==0.115.0
+uvicorn==0.30.6
+EOF
+
+cat > app/tests/test_health.py << 'EOF'
+from fastapi.testclient import TestClient
+from app.main import app
+
+def test_health():
+    c = TestClient(app)
+    r = c.get("/healthz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+EOF
+
+# ------------------------------------------------------------------------------
+# Dockerfile
+# ------------------------------------------------------------------------------
+cat > Dockerfile << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY app/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+ENV PYTHONPATH=/app
+ENV APP_ENV=dev
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+
+# ------------------------------------------------------------------------------
+# Helm chart
+# ------------------------------------------------------------------------------
+mkdir -p helm/app-chart/templates
+
+cat > helm/app-chart/Chart.yaml << 'EOF'
+apiVersion: v2
+name: fastapi-app
+description: FastAPI app deployed via Helm
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+EOF
+
+cat > helm/app-chart/values.yaml << 'EOF'
+replicaCount: 2
+image:
+  repository: ghcr.io/youruser/fastapi-app
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+env:
+  APP_ENV: "dev"
+  SERVICE_NAME: "fastapi-app"
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+  limits:
+    cpu: "250m"
+    memory: "256Mi"
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+EOF
+
+cat > helm/app-chart/values-stage.yaml << 'EOF'
+env:
+  APP_ENV: "stage"
+replicaCount: 3
+hpa:
+  minReplicas: 3
+  maxReplicas: 8
+EOF
+
+cat > helm/app-chart/values-prod.yaml << 'EOF'
+env:
+  APP_ENV: "prod"
+replicaCount: 4
+hpa:
+  minReplicas: 4
+  maxReplicas: 12
+EOF
+
+cat > helm/app-chart/templates/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: { app.kubernetes.io/name: {{ include "fastapi-app.name" . }} }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: {{ include "fastapi-app.name" . }} }
+    spec:
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: APP_ENV
+              value: {{ .Values.env.APP_ENV | quote }}
+            - name: SERVICE_NAME
+              value: {{ .Values.env.SERVICE_NAME | quote }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+EOF
+
+cat > helm/app-chart/templates/service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "fastapi-app.name" . }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+EOF
+
+cat > helm/app-chart/templates/hpa.yaml << 'EOF'
+{{- if .Values.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "fastapi-app.fullname" . }}
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+EOF
+
+# ------------------------------------------------------------------------------
+# Kubernetes namespaces
+# ------------------------------------------------------------------------------
+mkdir -p k8s
+
+cat > k8s/namespaces.yaml << 'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: { name: dev }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: stage }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: prod }
+EOF
+
+# ------------------------------------------------------------------------------
+# Jenkinsfile
+# ------------------------------------------------------------------------------
+cat > Jenkinsfile << 'EOF'
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  parameters {
+    choice(name: 'CLOUD', choices: ['aws','gcp'], description: 'Target cloud')
+    choice(name: 'ENV',   choices: ['dev','stage','prod'], description: 'Kubernetes namespace')
+    string(name: 'IMAGE_REPO', defaultValue: 'ghcr.io/youruser/fastapi-app', description: 'Container repo')
+    string(name: 'IMAGE_TAG',  defaultValue: '', description: 'If empty uses GIT short SHA')
+  }
+
+  environment {
+    SHORT_SHA = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+    IMAGE_TAG_EFF = "${params.IMAGE_TAG ?: SHORT_SHA}"
+    IMAGE = "${params.IMAGE_REPO}:${IMAGE_TAG_EFF}"
+    HELM_CHART = "helm/app-chart"
+    VALUES_FILE = "helm/app-chart/values.yaml"
+  }
+
+  stages {
+    stage('Prep') {
+      steps {
+        script {
+          if (params.ENV == 'stage') { env.VALUES_FILE = "helm/app-chart/values-stage.yaml" }
+          if (params.ENV == 'prod')  { env.VALUES_FILE = "helm/app-chart/values-prod.yaml" }
+        }
+        sh 'python -V || true'
+        sh 'helm version || true'
+        sh 'kubectl version --client=true || true'
+      }
+    }
+
+    stage('Install deps') {
+      agent { label 'docker' }
+      steps {
+        sh 'python -m venv .venv && . .venv/bin/activate && pip install -r app/requirements.txt pytest'
+      }
+    }
+
+    stage('Unit tests') {
+      steps {
+        sh '. .venv/bin/activate && pytest -q'
+      }
+    }
+
+    stage('Build image') {
+      steps {
+        sh "docker build -t ${IMAGE} ."
+      }
+    }
+
+    stage('Auth to registry') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'REGISTRY_CREDS', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+          sh 'echo "$PASS" | docker login "${IMAGE_REPO%/*}" -u "$USER" --password-stdin'
+        }
+      }
+    }
+
+    stage('Push image') {
+      steps {
+        sh "docker push ${IMAGE}"
+      }
+    }
+
+    stage('KubeCreds') {
+      steps {
+        script {
+          if (params.CLOUD == 'aws') {
+            withCredentials([string(credentialsId: 'AWS_KUBECONFIG', variable: 'KCFG')]) {
+              writeFile file: 'kubeconfig', text: KCFG
+              sh 'export KUBECONFIG=$PWD/kubeconfig && kubectl get ns'
+              env.KUBECONFIG = "$PWD/kubeconfig"
+            }
+          } else {
+            withCredentials([string(credentialsId: 'GCP_KUBECONFIG', variable: 'KCFG')]) {
+              writeFile file: 'kubeconfig', text: KCFG
+              sh 'export KUBECONFIG=$PWD/kubeconfig && kubectl get ns'
+              env.KUBECONFIG = "$PWD/kubeconfig"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        sh '''
+          set -e
+          kubectl apply -f k8s/namespaces.yaml
+          helm upgrade --install fastapi-app ${HELM_CHART} \
+            -n ${ENV} \
+            -f ${VALUES_FILE} \
+            --set image.tag=${IMAGE_TAG_EFF} \
+            --set image.repository=${IMAGE_REPO}
+        '''
+      }
+    }
+
+    stage('Smoke check') {
+      steps {
+        sh '''
+          kubectl -n ${ENV} rollout status deploy/fastapi-app --timeout=120s
+          kubectl -n ${ENV} get svc
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: '**/pytest*.xml', allowEmptyArchive: true
+    }
+  }
+}
+EOF
+
+# ------------------------------------------------------------------------------
+# Terraform: AWS EKS
+# ------------------------------------------------------------------------------
+mkdir -p infra/aws-eks
+
+cat > infra/aws-eks/main.tf << 'EOF'
+terraform {
+  required_version = ">= 1.6"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+}
+
+provider "aws" { region = var.region }
+
+resource "aws_eks_cluster" "this" {
+  name     = var.cluster_name
+  role_arn = var.cluster_role_arn
+  version  = "1.30"
+  vpc_config { subnet_ids = var.subnet_ids }
+}
+
+output "cluster_name" { value = aws_eks_cluster.this.name }
+EOF
+
+cat > infra/aws-eks/variables.tf << 'EOF'
+variable "region" { type = string }
+variable "cluster_name" { type = string }
+variable "cluster_role_arn" { type = string }
+variable "subnet_ids" { type = list(string) }
+EOF
+
+cat > infra/aws-eks/outputs.tf << 'EOF'
+output "cluster_name" { value = aws_eks_cluster.this.name }
+EOF
+
+# ------------------------------------------------------------------------------
+# Terraform: GCP GKE
+# ------------------------------------------------------------------------------
+mkdir -p infra/gcp-gke
+
+cat > infra/gcp-gke/main.tf << 'EOF'
+terraform {
+  required_version = ">= 1.6"
+  required_providers {
+    google = { source = "hashicorp/google", version = "~> 5.0" }
+  }
+}
+
+provider "google" {
+  project = var.project
+  region  = var.region
+}
+
+resource "google_container_cluster" "primary" {
+  name     = var.cluster_name
+  location = var.region
+  remove_default_node_pool = true
+  initial_node_count       = 1
+}
+
+resource "google_container_node_pool" "pool" {
+  name       = "default-pool"
+  location   = var.region
+  cluster    = google_container_cluster.primary.name
+  node_count = 2
+  node_config {
+    machine_type = "e2-standard-2"
+    oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+  }
+}
+
+output "cluster_name" { value = google_container_cluster.primary.name }
+EOF
+
+cat > infra/gcp-gke/variables.tf << 'EOF'
+variable "project" { type = string }
+variable "region"  { type = string }
+variable "cluster_name" { type = string }
+EOF
+
+cat > infra/gcp-gke/outputs.tf << 'EOF'
+output "cluster_name" { value = google_container_cluster.primary.name }
+EOF
+
+# ------------------------------------------------------------------------------
+# GitHub workflow
+# ------------------------------------------------------------------------------
+mkdir -p .github/workflows
+
+cat > .github/workflows/lint.yml << 'EOF'
+name: lint
+on: [pull_request]
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install black flake8
+      - run: black --check app
+      - run: flake8 app
+EOF
+
+echo "✨ Project structure created successfully!"
+
